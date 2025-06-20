@@ -264,3 +264,258 @@ void restoreFiles(const std::map<fs::path, std::string>& filesToRestore) {
         writeFile(path, content);             // Write content to the specified path
     }
 }
+std::string findCommonAncestor(const std::string& commitHash1, const std::string& commitHash2) {
+    // Queues for BFS traversal
+    std::queue<std::string> q1, q2;
+    // Sets to keep track of visited commits and commits reachable from each branch
+    std::unordered_set<std::string> visited1, visited2;
+    std::unordered_set<std::string> path1, path2; // Commits on the path from commit1/commit2 back to root
+
+    // Start BFS from both commit hashes
+    q1.push(commitHash1);
+    visited1.insert(commitHash1);
+    path1.insert(commitHash1);
+
+    q2.push(commitHash2);
+    visited2.insert(commitHash2);
+    path2.insert(commitHash2);
+
+    // Continue as long as there are commits to explore in either queue
+    while (!q1.empty() || !q2.empty()) {
+        // Process commits from q1
+        if (!q1.empty()) {
+            std::string current = q1.front();
+            q1.pop();
+
+            // If this commit is also reachable from commit2, it's a common ancestor
+            if (path2.count(current)) {
+                return current; // Found a common ancestor (might not be the lowest, but a valid one)
+            }
+
+            // Parse commit to get its parents
+            // This assumes parseCommitObject is defined earlier in the file.
+            CommitObject commit = parseCommitObject(current);
+            for (const std::string& parent : commit.parent_hashes) {
+                if (visited1.find(parent) == visited1.end()) { // If parent not yet visited for branch 1
+                    visited1.insert(parent);
+                    path1.insert(parent);
+                    q1.push(parent);
+                }
+            }
+        }
+
+        // Process commits from q2
+        if (!q2.empty()) {
+            std::string current = q2.front();
+            q2.pop();
+
+            // If this commit is also reachable from commit1, it's a common ancestor
+            if (path1.count(current)) {
+                return current; // Found a common ancestor (might not be the lowest, but a valid one)
+            }
+
+            // Parse commit to get its parents
+            // This assumes parseCommitObject is defined earlier in the file.
+            CommitObject commit = parseCommitObject(current);
+            for (const std::string& parent : commit.parent_hashes) {
+                if (visited2.find(parent) == visited2.end()) { // If parent not yet visited for branch 2
+                    visited2.insert(parent);
+                    path2.insert(parent);
+                    q2.push(parent);
+                }
+            }
+        }
+    }
+
+    // No common ancestor found (e.g., if histories are completely divergent)
+    return "";
+}
+
+
+// --- Main Merge Handler Function ---
+// This function relies on other MiniGit functions (like getHeadCommitHash, getBranchCommit,
+// branchExists, parseCommitObject, getTreeFiles, createTreeFromFiles, saveCommit,
+// updateHead, cleanWorkingDirectory, restoreFiles, updateIndex).
+// Ensure these functions are defined earlier in your israel core utility.cpp file.
+void handleMerge(const std::string& branchName) {
+    if (!branchExists(branchName)) {
+        std::cerr << "Error: Branch '" << branchName << "' does not exist." << std::endl;
+        return;
+    }
+
+    std::string currentCommitHash = getHeadCommitHash();
+    std::string branchCommitHash = getBranchCommit(branchName);
+
+    if (currentCommitHash.empty()) {
+        std::cerr << "Error: No commits on current branch to merge." << std::endl;
+        return;
+    }
+
+    if (currentCommitHash == branchCommitHash) {
+        std::cout << "Already up to date." << std::endl;
+        return;
+    }
+
+    // Find the lowest common ancestor (LCA)
+    std::string commonAncestorHash = findCommonAncestor(currentCommitHash, branchCommitHash);
+    
+    if (commonAncestorHash.empty()) {
+        std::cerr << "Error: Could not find common ancestor between current branch and '" << branchName << "'." << std::endl;
+        return;
+    }
+
+    // Get all files from LCA, current branch, and target branch
+    std::map<fs::path, std::string> ancestorFiles = getTreeFiles(parseCommitObject(commonAncestorHash).tree_hash);
+    std::map<fs::path, std::string> currentFiles = getTreeFiles(parseCommitObject(currentCommitHash).tree_hash);
+    std::map<fs::path, std::string> branchFiles = getTreeFiles(parseCommitObject(branchCommitHash).tree_hash);
+
+    // Merge changes
+    std::set<fs::path> allFiles;
+    for (const auto& [path, _] : ancestorFiles) allFiles.insert(path);
+    for (const auto& [path, _] : currentFiles) allFiles.insert(path);
+    for (const auto& [path, _] : branchFiles) allFiles.insert(path);
+
+    bool hasConflict = false;
+    std::map<fs::path, std::string> mergedFiles;
+
+    for (const auto& filePath : allFiles) {
+        std::string ancestorHash = ancestorFiles.count(filePath) ? ancestorFiles.at(filePath) : "";
+        std::string currentHash = currentFiles.count(filePath) ? currentFiles.at(filePath) : "";
+        std::string branchHash = branchFiles.count(filePath) ? branchFiles.at(filePath) : "";
+
+        if (ancestorHash == currentHash && ancestorHash == branchHash) {
+            // No changes in any branch from ancestor
+            if(currentFiles.count(filePath)) mergedFiles[filePath] = currentHash; // If file existed, keep it
+            // else: file was deleted in all, so don't add to mergedFiles
+        } else if (ancestorHash == currentHash && ancestorHash != branchHash) {
+            // Changed in branch, not in current (or deleted in branch, not in current)
+            if(branchFiles.count(filePath)) { // If file exists in branch, take branch version
+                mergedFiles[filePath] = branchHash;
+            } else { // File was deleted in branch
+                // Don't add to mergedFiles (effectively delete)
+            }
+        } else if (ancestorHash != currentHash && ancestorHash == branchHash) {
+            // Changed in current, not in branch (or deleted in current, not in branch)
+            if(currentFiles.count(filePath)) { // If file exists in current, take current version
+                mergedFiles[filePath] = currentHash;
+            } else { // File was deleted in current
+                // Don't add to mergedFiles (effectively delete)
+            }
+        } else if (currentHash == branchHash) {
+            // Same change in both (or same deletion in both)
+            if(currentFiles.count(filePath)) mergedFiles[filePath] = currentHash;
+        } else {
+            // Conflict: changed differently in both OR one deleted and other modified.
+            std::cerr << "CONFLICT: Both modified " << filePath.string() << std::endl;
+            hasConflict = true;
+            // For a simple MiniGit, we will take the current version in case of conflict.
+            // A more robust Git would write conflict markers (<<<<<<<, =======, >>>>>>>)
+            // into the file in the working directory and mark it as conflicted in the index.
+            if(currentFiles.count(filePath)) mergedFiles[filePath] = currentHash;
+            // If deleted in one and modified in other, this simplified merge takes the modified version.
+        }
+    }
+
+    // If there were conflicts, we don't auto-commit. We update the working directory
+    // and staging area with our simplified merge, and let the user resolve.
+    if (hasConflict) {
+        std::cerr << "Merge failed due to conflicts - please resolve them manually." << std::endl;
+        // Update working directory and staging area to the state after the simplified merge
+        cleanWorkingDirectory(getPaths(mergedFiles));
+        restoreFiles(mergedFiles);
+        staging_area = mergedFiles; // Staging area now reflects the (potentially conflicted) merge result
+        updateIndex();
+        return; // Exit without creating a merge commit
+    }
+
+    // Create a merge commit
+    // This assumes createTreeFromFiles and saveCommit are defined earlier.
+    CommitObject newCommit;
+    newCommit.tree_hash = createTreeFromFiles(mergedFiles);
+    newCommit.message = "Merge branch '" + branchName + "' into " + current_branch;
+    newCommit.author = "User <user@example.com>";
+    newCommit.committer = "User <user@example.com>";
+    newCommit.parent_hashes.push_back(currentCommitHash); // Parent 1: current branch HEAD
+    newCommit.parent_hashes.push_back(branchCommitHash); // Parent 2: merged branch HEAD
+
+    std::string commitHash = saveCommit(newCommit);
+    updateHead(commitHash, current_branch); // Update HEAD and the current branch pointer
+
+    // Update working directory and staging area to reflect the successful merge
+    cleanWorkingDirectory(getPaths(mergedFiles));
+    restoreFiles(mergedFiles);
+    staging_area = mergedFiles; // Update staging area to reflect the merge
+    updateIndex();
+
+    std::cout << "Successfully merged '" << branchName << "' into '" << current_branch << "'." << std::endl;
+}
+
+// --- Main Function (with merge command added) ---
+// This assumes handleInit, handleAdd, handleCommit, handleLog,
+// handleBranch, handleCheckout are defined earlier in the file.
+// Also assumes standard includes like <iostream>, <vector>, etc., are at the top.
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <command> [args...]" << std::endl;
+        return 1;
+    }
+
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) {
+        args.push_back(argv[i]);
+    }
+
+    std::string command = args[0];
+
+    try {
+        if (command == "init") {
+            handleInit();
+        } else if (command == "add") {
+            if (args.size() < 2) {
+                std::cerr << "Usage: minigit add <file1> [file2...]" << std::endl;
+                return 1;
+            }
+            std::vector<std::string> files(args.begin() + 1, args.end());
+            handleAdd(files);
+        } else if (command == "commit") {
+            if (args.size() != 3 || args[1] != "-m") {
+                std::cerr << "Usage: minigit commit -m \"<message>\"" << std::endl;
+                return 1;
+            }
+            handleCommit(args[2]);
+        } else if (command == "log") {
+            handleLog();
+        } else if (command == "branch") {
+            if (args.size() == 1) {
+                handleBranch("");
+            } else if (args.size() == 2) {
+                handleBranch(args[1]);
+            } else {
+                std::cerr << "Usage: minigit branch OR minigit branch <name>" << std::endl;
+                return 1;
+            }
+        } else if (command == "checkout") {
+            if (args.size() != 2) {
+                std::cerr << "Usage: minigit checkout <branch_name_or_commit_hash>" << std::endl;
+                return 1;
+            }
+            handleCheckout(args[1]);
+        } else if (command == "merge") { // Added merge command handler
+            if (args.size() != 2) {
+                std::cerr << "Usage: minigit merge <branch_name>" << std::endl;
+                return 1;
+            }
+            handleMerge(args[1]);
+        } 
+        else {
+            std::cerr << "Unknown command: " << command << std::endl;
+            std::cerr << "Available commands: init, add, commit, log, branch, checkout, merge" << std::endl; // Updated for merge
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
